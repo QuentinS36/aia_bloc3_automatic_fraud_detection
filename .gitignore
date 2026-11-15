@@ -1,0 +1,27 @@
+# --- Terraform ---
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+
+# --- Secrets ---
+.env
+*.pem
+credentials*
+
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+
+# --- Données et modèles ---
+data/
+models/*.joblib
+*.csv
+
+# --- Docker / Airflow (logs locaux) ---
+logs/
+
+# --- Documents ---
+docs/

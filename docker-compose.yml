@@ -1,0 +1,142 @@
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Environnement de développement local du pipeline de détection de fraude.
+#
+#  - MinIO   : imite S3 en local (même API), pour développer sans compte AWS.
+#              À remplacer par le vrai bucket S3 (créé via Terraform) plus tard.
+#  - Airflow : orchestre les tâches (ingestion, contrôle qualité, scoring...).
+#  - Postgres locale : base de MÉTADONNÉES d'Airflow uniquement (planning,
+#    historique des exécutions). Ce n'est PAS Neon : Neon reste réservé aux
+#    données métier (transactions, prédictions), pour ne pas gaspiller son
+#    quota gratuit avec le fonctionnement interne d'Airflow.
+# ---------------------------------------------------------------------------
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.10.3-python3.11
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+    # Identifiants MinIO transmis aux tâches (jamais écrits en dur dans le code)
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    AWS_REGION: ${AWS_REGION:-eu-west-3}
+    S3_BUCKET: ${S3_BUCKET}
+    API_URL: https://sdacelo-real-time-fraud-detection.hf.space/current-transactions
+    MODEL_METADATA_PATH: /opt/airflow/models/model_v1_metadata.json
+    MODEL_PATH: /opt/airflow/models/model_v1.joblib
+    NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
+    NOTIFY_WEBHOOK_KIND: ${NOTIFY_WEBHOOK_KIND:-discord}
+    NEON_CONNECTION_STRING: ${NEON_CONNECTION_STRING}
+    HASH_SALT: ${HASH_SALT}
+    # Installé au démarrage du conteneur (simple pour le développement ;
+    # pour un usage plus durable on construirait une image Airflow dédiée).
+    _PIP_ADDITIONAL_REQUIREMENTS: boto3 pandas scikit-learn joblib psycopg[binary]
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./src:/opt/airflow/src
+    - ./models:/opt/airflow/models
+    - ./data:/opt/airflow/data
+    - ./infra:/opt/airflow/infra
+  depends_on:
+    airflow-postgres:
+      condition: service_healthy
+
+services:
+  # --- Stockage brut, imitation de S3 en local ---
+  # NB : l'image officielle "minio/minio" n'est plus distribuée gratuitement sur
+  # Docker Hub depuis fin 2025 (changement de politique commerciale de l'éditeur).
+  # On utilise donc "pgsty/minio", un fork communautaire activement maintenu et
+  # strictement compatible (même API S3, même logiciel).
+  minio:
+    image: pgsty/minio:RELEASE.2026-06-18T00-00-00Z
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # API (compatible S3)
+      - "9001:9001"   # console web (identifiants ci-dessous)
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - minio-data:/data
+    # Pas de "healthcheck" ici : ces images minimales n'embarquent pas toujours
+    # curl/wget. C'est le service "minio-init" ci-dessous qui patiente et réessaie.
+
+  # --- Crée automatiquement le bucket au démarrage (équivalent local du Terraform) ---
+  # Utilise boto3 (la même librairie que le futur code d'ingestion) plutôt que
+  # l'outil "mc", pour ne pas dépendre d'un binaire qui pourrait manquer dans l'image.
+  minio-init:
+    image: python:3.11-slim
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    command: >
+      /bin/sh -c "
+      pip install --quiet boto3 &&
+      python /init/create_bucket.py
+      "
+    volumes:
+      - ./infra/local:/init:ro
+
+  # --- Base de métadonnées d'Airflow (interne, distincte de Neon) ---
+  airflow-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      retries: 5
+
+  # --- Initialise la base Airflow et crée l'utilisateur admin (une seule fois) ---
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: >
+      /bin/bash -c "
+      airflow db migrate &&
+      airflow users create --username admin --password admin --firstname Admin --lastname Admin --role Admin --email admin@example.com
+      "
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8081:8080"
+    depends_on:
+      - airflow-init
+      - minio-init
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      - airflow-init
+
+  # --- Tableau de bord de monitoring (C4), lecture seule sur Neon ---
+  dashboard:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./dashboard:/app
+    environment:
+      NEON_CONNECTION_STRING: ${NEON_CONNECTION_STRING}
+    ports:
+      - "8501:8501"
+    command: >
+      /bin/sh -c "
+      pip install --quiet -r requirements.txt &&
+      streamlit run app.py --server.address=0.0.0.0 --server.port=8501
+      "
+
+volumes:
+  minio-data:
+  airflow-db-data:
