@@ -24,5 +24,4 @@ models/*.joblib
 logs/
 
 # --- Documents ---
-docs/*.mp4
-docs/*.pptx
+docs/perso/

@@ -12,7 +12,7 @@ structuré, et produit un rapport quotidien ainsi qu'un tableau de bord de monit
 
 ## Architecture
 
-![Schéma d'architecture](docs/architecture.jpg)
+![Schéma d'architecture](docs/livrables/architecture.jpg)
 
 **Chemin quasi temps réel** (chaque minute) : l'API de paiements est interrogée par un DAG
 Airflow, qui valide chaque transaction (schéma, montant, coordonnées, cohérence), la dépose
